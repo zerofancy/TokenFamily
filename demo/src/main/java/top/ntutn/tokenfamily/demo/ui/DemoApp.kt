@@ -1,0 +1,419 @@
+package top.ntutn.tokenfamily.demo.ui
+
+import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.rememberLazyListState
+import androidx.compose.foundation.text.KeyboardActions
+import androidx.compose.foundation.text.KeyboardOptions
+import androidx.compose.material3.*
+import androidx.compose.runtime.*
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.LocalFocusManager
+import androidx.compose.ui.text.input.ImeAction
+import androidx.compose.ui.unit.dp
+import com.google.gson.Gson
+import com.google.gson.JsonObject
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+import okhttp3.MediaType.Companion.toMediaType
+import okhttp3.RequestBody.Companion.toRequestBody
+import top.ntutn.tokenfamily.sdk.TokenFamily
+import top.ntutn.tokenfamily.sdk.interceptor.TokenFamilyInterceptor
+import top.ntutn.tokenfamily.sdk.exception.TokenFamilyException
+
+data class ChatMessage(val role: String, val content: String, val isStreaming: Boolean = false)
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+fun DemoApp() {
+    MaterialTheme {
+        val scope = rememberCoroutineScope()
+        val focusManager = LocalFocusManager.current
+        val listState = rememberLazyListState()
+
+        var input by remember { mutableStateOf("") }
+        var modelName by remember { mutableStateOf("") }
+        var isLoading by remember { mutableStateOf(false) }
+        var isStreamMode by remember { mutableStateOf(false) }
+        var statusText by remember { mutableStateOf("就绪") }
+        var messages by remember { mutableStateOf(listOf<ChatMessage>()) }
+
+        val interceptor = remember {
+            val connector = TokenFamily.getServiceConnector()
+            TokenFamilyInterceptor(connector)
+        }
+
+        val okHttpClient = remember {
+            okhttp3.OkHttpClient.Builder()
+                .addInterceptor(interceptor)
+                .build()
+        }
+
+        LaunchedEffect(messages.size) {
+            if (messages.isNotEmpty()) {
+                listState.animateScrollToItem(messages.size - 1)
+            }
+        }
+
+        Scaffold(
+            topBar = {
+                TopAppBar(
+                    title = { Text("词元芯核 SDK Demo") },
+                    actions = {
+                        Text(
+                            if (isStreamMode) "流式" else "非流式",
+                            modifier = Modifier.padding(end = 8.dp),
+                            style = MaterialTheme.typography.labelMedium,
+                            color = MaterialTheme.colorScheme.primary
+                        )
+                        Switch(
+                            checked = isStreamMode,
+                            onCheckedChange = { isStreamMode = it }
+                        )
+                    }
+                )
+            }
+        ) { padding ->
+            Column(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .padding(padding)
+            ) {
+                LazyColumn(
+                    modifier = Modifier
+                        .weight(1f)
+                        .fillMaxWidth()
+                        .padding(horizontal = 16.dp),
+                    state = listState,
+                    verticalArrangement = Arrangement.spacedBy(8.dp),
+                    contentPadding = PaddingValues(vertical = 8.dp)
+                ) {
+                    if (messages.isEmpty()) {
+                        item {
+                            Box(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .padding(32.dp),
+                                contentAlignment = Alignment.Center
+                            ) {
+                                Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                                    Text(
+                                        "词元芯核 SDK 演示",
+                                        style = MaterialTheme.typography.titleLarge
+                                    )
+                                    Spacer(modifier = Modifier.height(8.dp))
+                                    Text(
+                                        "输入消息测试 SDK 接入\n词元芯核 会通过 Binder 转发请求",
+                                        style = MaterialTheme.typography.bodyMedium,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                                    )
+                                    Spacer(modifier = Modifier.height(16.dp))
+                                    Text(
+                                        "SDK 状态: ${connectorStatusText()}",
+                                        style = MaterialTheme.typography.bodySmall,
+                                        color = MaterialTheme.colorScheme.primary
+                                    )
+                                }
+                            }
+                        }
+                    }
+
+                    items(messages) { msg ->
+                        MessageBubble(msg)
+                    }
+                }
+
+                if (isLoading) {
+                    LinearProgressIndicator(modifier = Modifier.fillMaxWidth())
+                }
+
+                Text(
+                    text = statusText,
+                    modifier = Modifier.padding(horizontal = 16.dp),
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+
+                OutlinedTextField(
+                    value = modelName,
+                    onValueChange = { modelName = it },
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(horizontal = 16.dp),
+                    placeholder = { Text("模型名 (留空使用默认)") },
+                    enabled = !isLoading,
+                    singleLine = true
+                )
+
+                OutlinedTextField(
+                    value = input,
+                    onValueChange = { input = it },
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(horizontal = 16.dp, vertical = 8.dp),
+                    placeholder = { Text("输入消息...") },
+                    enabled = !isLoading,
+                    keyboardOptions = KeyboardOptions(imeAction = ImeAction.Send),
+                    keyboardActions = KeyboardActions(
+                        onSend = {
+                            if (input.isNotBlank() && !isLoading) {
+                                val userMessage = input.trim()
+                                input = ""
+                                focusManager.clearFocus()
+
+                                scope.launch {
+                                    sendMessage(
+                                        okHttpClient = okHttpClient,
+                                        isStreamMode = isStreamMode,
+                                        modelName = modelName,
+                                        userMessage = userMessage,
+                                        messages = messages,
+                                        onMessagesUpdate = { messages = it },
+                                        onLoadingChange = { isLoading = it },
+                                        onStatusChange = { statusText = it },
+                                        onError = {
+                                            statusText = "错误: ${it.message}"
+                                            isLoading = false
+                                        }
+                                    )
+                                }
+                            }
+                        }
+                    ),
+                    minLines = 2,
+                    maxLines = 4
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun MessageBubble(msg: ChatMessage) {
+    val isUser = msg.role == "user"
+    val alignment = if (isUser) Alignment.End else Alignment.Start
+    val bgColor = if (isUser) {
+        MaterialTheme.colorScheme.primaryContainer
+    } else {
+        MaterialTheme.colorScheme.surfaceVariant
+    }
+
+    Column(
+        modifier = Modifier.fillMaxWidth(),
+        horizontalAlignment = alignment
+    ) {
+        Surface(
+            shape = MaterialTheme.shapes.medium,
+            color = bgColor,
+            modifier = Modifier.widthIn(max = 300.dp)
+        ) {
+            Column(modifier = Modifier.padding(12.dp)) {
+                Text(
+                    text = if (isUser) "你" else "AI",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.primary
+                )
+                Spacer(modifier = Modifier.height(4.dp))
+                Text(
+                    text = msg.content,
+                    style = MaterialTheme.typography.bodyMedium
+                )
+                if (msg.isStreaming) {
+                    Spacer(modifier = Modifier.height(4.dp))
+                    LinearProgressIndicator(modifier = Modifier.fillMaxWidth())
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun connectorStatusText(): String {
+    val connector = remember { TokenFamily.getServiceConnector() }
+    val isConnected by connector.isConnected.collectAsState()
+    return if (isConnected) "已连接" else "未连接"
+}
+
+private suspend fun sendMessage(
+    okHttpClient: okhttp3.OkHttpClient,
+    isStreamMode: Boolean,
+    modelName: String,
+    userMessage: String,
+    messages: List<ChatMessage>,
+    onMessagesUpdate: (List<ChatMessage>) -> Unit,
+    onLoadingChange: (Boolean) -> Unit,
+    onStatusChange: (String) -> Unit,
+    onError: (Exception) -> Unit
+) {
+    onLoadingChange(true)
+    if (!isStreamMode) {
+        onStatusChange("发送中...")
+    } else {
+        onStatusChange("流式接收中...")
+    }
+
+    val updatedMessages = messages + ChatMessage("user", userMessage)
+    onMessagesUpdate(updatedMessages)
+
+    val jsonMessages = buildString {
+        append("[")
+        updatedMessages.forEachIndexed { i, msg ->
+            if (i > 0) append(",")
+            append("""{"role":"${msg.role}","content":"${escapeJson(msg.content)}"}""")
+        }
+        append("]")
+    }
+
+    val requestBody = """
+        {
+            "model": "${modelName}",
+            "messages": $jsonMessages,
+            "stream": $isStreamMode
+        }
+    """.trimIndent()
+
+    val request = okhttp3.Request.Builder()
+        .url("https://api.openai.com/v1/chat/completions")
+        .post(requestBody.toRequestBody("application/json; charset=utf-8".toMediaType()))
+        .build()
+
+    try {
+        if (isStreamMode) {
+            withContext(Dispatchers.IO) {
+                handleStreamResponse(
+                    okHttpClient = okHttpClient,
+                    request = request,
+                    messages = updatedMessages,
+                    onMessagesUpdate = onMessagesUpdate,
+                    onLoadingChange = onLoadingChange,
+                    onStatusChange = onStatusChange
+                )
+            }
+        } else {
+            withContext(Dispatchers.IO) {
+                handleNonStreamResponse(
+                    okHttpClient = okHttpClient,
+                    request = request,
+                    messages = updatedMessages,
+                    onMessagesUpdate = onMessagesUpdate,
+                    onLoadingChange = onLoadingChange,
+                    onStatusChange = onStatusChange
+                )
+            }
+        }
+    } catch (e: TokenFamilyException) {
+        val friendlyError = when (e.errorCode) {
+            "KEY_MISSING" -> "请先在词元芯核 App 中配置 API 密钥"
+            "UNAUTHORIZED" -> "应用未授权，请在词元芯核 App 中授权"
+            "BIND_FAILED" -> "无法连接词元芯核服务"
+            "NOT_INSTALLED" -> "词元芯核 App 未安装"
+            else -> e.message ?: "未知错误"
+        }
+        onError(TokenFamilyException(e.errorCode, friendlyError))
+    } catch (e: Exception) {
+        onError(e)
+    }
+}
+
+private suspend fun handleNonStreamResponse(
+    okHttpClient: okhttp3.OkHttpClient,
+    request: okhttp3.Request,
+    messages: List<ChatMessage>,
+    onMessagesUpdate: (List<ChatMessage>) -> Unit,
+    onLoadingChange: (Boolean) -> Unit,
+    onStatusChange: (String) -> Unit
+) {
+    val response = okHttpClient.newCall(request).execute()
+    val body = response.body?.string() ?: ""
+    val content = extractContent(body)
+    response.close()
+
+    onMessagesUpdate(messages + ChatMessage("assistant", content))
+    onStatusChange("完成")
+    onLoadingChange(false)
+}
+
+private suspend fun handleStreamResponse(
+    okHttpClient: okhttp3.OkHttpClient,
+    request: okhttp3.Request,
+    messages: List<ChatMessage>,
+    onMessagesUpdate: (List<ChatMessage>) -> Unit,
+    onLoadingChange: (Boolean) -> Unit,
+    onStatusChange: (String) -> Unit
+) {
+    val response = okHttpClient.newCall(request).execute()
+    val source = response.body?.source() ?: run {
+        onLoadingChange(false)
+        return
+    }
+
+    var streamingContent = ""
+    var streamingChunk = ""
+    val streamingMsg = ChatMessage("assistant", "", isStreaming = true)
+    onMessagesUpdate(messages + streamingMsg)
+
+    source.use { bufferedSource ->
+        while (!bufferedSource.exhausted()) {
+            val line = bufferedSource.readUtf8Line() ?: break
+            if (line.startsWith("data: ")) {
+                val data = line.removePrefix("data: ").trim()
+                if (data == "[DONE]") break
+
+                val content = extractStreamContent(data)
+                if (content.isNotEmpty()) {
+                    streamingContent += content
+                    streamingChunk += content
+                    if (streamingChunk.length >= 8) {
+                        onMessagesUpdate(messages + ChatMessage("assistant", streamingContent, isStreaming = true))
+                        streamingChunk = ""
+                    }
+                }
+            }
+        }
+    }
+
+    onMessagesUpdate(messages + ChatMessage("assistant", streamingContent))
+    onStatusChange("完成")
+    onLoadingChange(false)
+}
+
+private fun extractContent(json: String): String {
+    return try {
+        val gson = com.google.gson.Gson()
+        val obj = gson.fromJson(json, com.google.gson.JsonObject::class.java)
+        obj.getAsJsonArray("choices")
+            ?.firstOrNull()
+            ?.asJsonObject
+            ?.getAsJsonObject("message")
+            ?.get("content")
+            ?.asString ?: ""
+    } catch (e: Exception) {
+        ""
+    }
+}
+
+private fun extractStreamContent(json: String): String {
+    return try {
+        val gson = com.google.gson.Gson()
+        val obj = gson.fromJson(json, com.google.gson.JsonObject::class.java)
+        obj.getAsJsonArray("choices")
+            ?.firstOrNull()
+            ?.asJsonObject
+            ?.getAsJsonObject("delta")
+            ?.get("content")
+            ?.asString ?: ""
+    } catch (e: Exception) {
+        ""
+    }
+}
+
+private fun escapeJson(s: String): String {
+    return s.replace("\\", "\\\\")
+        .replace("\"", "\\\"")
+        .replace("\n", "\\n")
+        .replace("\r", "\\r")
+        .replace("\t", "\\t")
+}

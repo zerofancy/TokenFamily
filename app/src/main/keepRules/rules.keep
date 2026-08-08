@@ -1,0 +1,7 @@
+-keep class top.ntutn.tokenfamily.aidl.** { *; }
+-keep class top.ntutn.tokenfamily.service.** { *; }
+-keep class top.ntutn.tokenfamily.data.** { *; }
+-keep class top.ntutn.tokenfamily.sdk.** { *; }
+-keepclassmembers class top.ntutn.tokenfamily.aidl.** implements android.os.Parcelable {
+    public static final android.os.Parcelable$Creator CREATOR;
+}

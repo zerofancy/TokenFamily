@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <queries>
+        <package android:name="top.ntutn.tokenfamily" />
+        <intent>
+            <action android:name="top.ntutn.tokenfamily.action.CHAT_SERVICE" />
+        </intent>
+    </queries>
+
+</manifest>

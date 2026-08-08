@@ -1,0 +1,2 @@
+-keep class top.ntutn.tokenfamily.aidl.** { *; }
+-keep class top.ntutn.tokenfamily.sdk.** { *; }

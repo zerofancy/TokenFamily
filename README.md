@@ -54,10 +54,12 @@ adb install demo/build/outputs/apk/debug/demo-debug.apk
 
 ### 3. 在自己的 App 中接入 SDK
 
+SDK 已发布到 Maven Central，坐标：`top.ntutn:tokenfamily-sdk`。
+
 ```kotlin
-// build.gradle.kts
+// app/build.gradle.kts
 dependencies {
-    implementation(project(":sdk"))
+    implementation("top.ntutn:tokenfamily-sdk:0.1.0")
     implementation("com.squareup.okhttp3:okhttp:4.12.0")
 }
 

@@ -16,22 +16,19 @@ TokenFamily（词元芯核）SDK 提供一组轻量 API，让第三方 Android �
 
 ### 步骤 1：添加依赖
 
-在项目级 `build.gradle.kts` 或 `settings.gradle.kts` 添加 SDK 模块：
+SDK 已发布到 Maven Central，坐标：`top.ntutn:tokenfamily-sdk`。
 
-```kotlin
-// settings.gradle.kts
-include(":sdk")
-```
-
-在应用模块依赖 SDK：
+在应用模块的 `build.gradle.kts` 添加依赖：
 
 ```kotlin
 // app/build.gradle.kts
 dependencies {
-    implementation(project(":sdk"))
+    implementation("top.ntutn:tokenfamily-sdk:0.1.0")
     implementation("com.squareup.okhttp3:okhttp:4.12.0")
 }
 ```
+
+> 若在项目内联开发（monorepo），可将依赖替换为 `implementation(project(":sdk"))`，并确认 `settings.gradle.kts` 中包含 `include(":sdk")`。
 
 ### 步骤 2：初始化
 

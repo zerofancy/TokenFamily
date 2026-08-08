@@ -72,6 +72,8 @@ fun KeyEditScreen(
                 value = apiBaseUrl,
                 onValueChange = { apiBaseUrl = it },
                 label = { Text("API Base URL") },
+                placeholder = { Text("https://openrouter.ai/api/v1  或  https://api.openai.com/v1") },
+                supportingText = { Text("可含 /v1，系统会自动补全 /chat/completions") },
                 modifier = Modifier.fillMaxWidth(),
                 singleLine = true
             )

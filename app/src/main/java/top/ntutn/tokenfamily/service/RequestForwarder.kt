@@ -32,7 +32,7 @@ class RequestForwarder(
         try {
             val requestBody = buildRequestBody(request, apiKeyConfig)
             val httpRequest = Request.Builder()
-                .url("${apiKeyConfig.apiBaseUrl.trimEnd('/')}/v1/chat/completions")
+                .url(ChatCompletionUrl.normalize(apiKeyConfig.apiBaseUrl))
                 .addHeader("Authorization", "Bearer ${apiKeyConfig.apiKey}")
                 .addHeader("Content-Type", "application/json")
                 .post(requestBody)

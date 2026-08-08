@@ -88,7 +88,7 @@ class StreamForwarder {
     ) = withContext(Dispatchers.IO) {
         val requestBody = buildStreamRequestBody(request, apiKeyConfig)
         val httpRequest = Request.Builder()
-            .url("${apiKeyConfig.apiBaseUrl.trimEnd('/')}/v1/chat/completions")
+            .url(ChatCompletionUrl.normalize(apiKeyConfig.apiBaseUrl))
             .addHeader("Authorization", "Bearer ${apiKeyConfig.apiKey}")
             .addHeader("Content-Type", "application/json")
             .post(requestBody)

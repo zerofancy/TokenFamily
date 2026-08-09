@@ -12,11 +12,6 @@ import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
 import android.util.Log
-import kotlinx.coroutines.CoroutineScope
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.SupervisorJob
-import kotlinx.coroutines.cancel
-import kotlinx.coroutines.launch
 import top.ntutn.tokenfamily.MainActivity
 import top.ntutn.tokenfamily.aidl.ChatCompletionRequest
 import top.ntutn.tokenfamily.aidl.ChatCompletionResponse
@@ -36,7 +31,6 @@ class ChatCompletionService : Service() {
         private const val AUTO_STOP_DELAY_MS = 5 * 60 * 1000L
     }
 
-    private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.Main)
     private val requestForwarder = RequestForwarder()
     private var streamForwarder: StreamForwarder? = null
     private var keyRepository: KeyRepository? = null
@@ -64,7 +58,6 @@ class ChatCompletionService : Service() {
 
     override fun onDestroy() {
         streamForwarder?.cancelAllStreams()
-        serviceScope.cancel()
         cancelAutoStop()
         Log.i(TAG, "Service destroyed")
         super.onDestroy()
@@ -95,38 +88,55 @@ class ChatCompletionService : Service() {
 
         override fun chat(request: ChatCompletionRequest): ChatCompletionResponse {
             if (!initialized) {
-                return buildErrorResponse("SERVICE_ERROR", "Service not initialized")
+                return RequestForwarder.errorResponse(503, "SERVICE_ERROR", "Service not initialized")
             }
 
             val callingUid = Binder.getCallingUid()
             val callingPackage = resolveCallingPackage(callingUid)
 
-            val auth = authManager ?: return buildErrorResponse("SERVICE_ERROR", "Auth not available")
+            val auth = authManager
+                ?: return RequestForwarder.errorResponse(503, "SERVICE_ERROR", "Auth not available")
             if (!auth.isAuthorized(callingUid, this@ChatCompletionService)) {
                 if (!auth.grantAuthorization(callingUid, this@ChatCompletionService)) {
-                    return buildErrorResponse("UNAUTHORIZED", "Package not authorized")
+                    return RequestForwarder.errorResponse(403, "UNAUTHORIZED", "Package not authorized")
                 }
             }
 
             val repo = keyRepository
-                ?: return buildErrorResponse("SERVICE_ERROR", "Key store not available")
-            val apiKeyConfig = repo.findKeyForModel(request.model)
-                ?: return buildErrorResponse("KEY_MISSING", "No API key configured")
+                ?: return RequestForwarder.errorResponse(503, "SERVICE_ERROR", "Key store not available")
+            val requestedModel = try {
+                requestForwarder.requestedModel(request.bodyJson)
+            } catch (e: IllegalArgumentException) {
+                return RequestForwarder.errorResponse(
+                    400,
+                    "INVALID_REQUEST",
+                    e.message ?: "Invalid JSON request"
+                )
+            }
+            val apiKeyConfig = repo.findKeyForModel(requestedModel)
+                ?: return RequestForwarder.errorResponse(503, "KEY_MISSING", "No API key configured")
 
             val response = kotlinx.coroutines.runBlocking {
                 requestForwarder.forward(request, apiKeyConfig)
             }
 
-            logCall(callingPackage ?: "unknown", request.model, false, response.totalTokens, response.errorCode.isEmpty())
+            logCall(
+                callingPackage ?: "unknown",
+                requestedModel.ifBlank { apiKeyConfig.defaultModel },
+                false,
+                extractTotalTokens(response.body),
+                response.statusCode in 200..299
+            )
 
             return response
         }
 
-        @OptIn(kotlinx.coroutines.ExperimentalCoroutinesApi::class)
-        override fun streamChat(request: ChatCompletionRequest, callback: IChatStreamCallback) {
+        override fun streamChat(
+            request: ChatCompletionRequest,
+            callback: IChatStreamCallback
+        ): ChatCompletionResponse {
             if (!initialized) {
-                callback.onError(request.requestId, "SERVICE_ERROR", "Service not initialized")
-                return
+                return RequestForwarder.errorResponse(503, "SERVICE_ERROR", "Service not initialized")
             }
 
             val callingUid = Binder.getCallingUid()
@@ -134,47 +144,50 @@ class ChatCompletionService : Service() {
 
             val auth = authManager
             if (auth == null) {
-                callback.onError(request.requestId, "SERVICE_ERROR", "Auth not available")
-                return
+                return RequestForwarder.errorResponse(503, "SERVICE_ERROR", "Auth not available")
             }
             if (!auth.isAuthorized(callingUid, this@ChatCompletionService)) {
                 if (!auth.grantAuthorization(callingUid, this@ChatCompletionService)) {
-                    callback.onError(request.requestId, "UNAUTHORIZED", "Package not authorized")
-                    return
+                    return RequestForwarder.errorResponse(403, "UNAUTHORIZED", "Package not authorized")
                 }
             }
 
             val repo = keyRepository
             if (repo == null) {
-                callback.onError(request.requestId, "SERVICE_ERROR", "Key store not available")
-                return
+                return RequestForwarder.errorResponse(503, "SERVICE_ERROR", "Key store not available")
             }
-            val apiKeyConfig = repo.findKeyForModel(request.model)
+            val requestedModel = try {
+                requestForwarder.requestedModel(request.bodyJson)
+            } catch (e: IllegalArgumentException) {
+                return RequestForwarder.errorResponse(
+                    400,
+                    "INVALID_REQUEST",
+                    e.message ?: "Invalid JSON request"
+                )
+            }
+            val apiKeyConfig = repo.findKeyForModel(requestedModel)
             if (apiKeyConfig == null) {
-                callback.onError(request.requestId, "KEY_MISSING", "No API key configured")
-                return
+                return RequestForwarder.errorResponse(503, "KEY_MISSING", "No API key configured")
             }
 
             val forwarder = streamForwarder
             if (forwarder == null) {
-                callback.onError(request.requestId, "SERVICE_ERROR", "Stream forwarder not available")
-                return
-            }
-
-            val requestId = request.requestId.ifEmpty {
-                java.util.UUID.randomUUID().toString()
-            }
-
-            serviceScope.launch {
-                forwarder.startStream(requestId, request, apiKeyConfig, callback)
-                logCall(
-                    callingPackage ?: "unknown",
-                    request.model,
-                    true,
-                    0,
-                    true
+                return RequestForwarder.errorResponse(
+                    503,
+                    "SERVICE_ERROR",
+                    "Stream forwarder not available"
                 )
             }
+
+            val response = forwarder.openStream(request, apiKeyConfig, callback)
+            logCall(
+                callingPackage ?: "unknown",
+                requestedModel.ifBlank { apiKeyConfig.defaultModel },
+                true,
+                0,
+                response.statusCode in 200..299
+            )
+            return response
         }
 
         override fun cancelStream(requestId: String) {
@@ -182,11 +195,15 @@ class ChatCompletionService : Service() {
         }
     }
 
-    private fun buildErrorResponse(code: String, message: String) =
-        ChatCompletionResponse().apply {
-            errorCode = code
-            errorMessage = message
-        }
+    private fun extractTotalTokens(body: String): Int = try {
+        com.google.gson.JsonParser.parseString(body)
+            .asJsonObject
+            .getAsJsonObject("usage")
+            ?.get("total_tokens")
+            ?.asInt ?: 0
+    } catch (_: Exception) {
+        0
+    }
 
     private fun resolveCallingPackage(uid: Int): String? {
         return try {

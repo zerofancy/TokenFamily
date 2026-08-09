@@ -1,134 +1,131 @@
 package top.ntutn.tokenfamily.sdk.binder
 
 import kotlinx.coroutines.channels.Channel
-import kotlinx.coroutines.channels.Channel.Factory.CONFLATED
-import okhttp3.MediaType.Companion.toMediaType
+import kotlinx.coroutines.withTimeoutOrNull
+import okhttp3.MediaType
 import okhttp3.ResponseBody
 import okio.BufferedSource
-import okio.ByteString.Companion.encodeUtf8
 import okio.Source
+import okio.Timeout
 import okio.buffer
-import okio.source
+import top.ntutn.tokenfamily.sdk.exception.TokenFamilyException
 import top.ntutn.tokenfamily.sdk.exception.StreamCancelledException
-import java.io.IOException
-import java.io.InterruptedIOException
+import java.util.concurrent.atomic.AtomicBoolean
 
 class StreamResponseWrapper(
-    private val requestId: String,
-    private val serviceConnector: ServiceConnector
+    private val cancelStream: () -> Unit,
+    private val isCallCancelled: () -> Boolean = { false },
+    private val mediaType: MediaType?
 ) {
 
-    private val channel = Channel<StreamEvent>(Channel.UNLIMITED)
-
-    private sealed class StreamEvent {
-        data class Data(val chunk: String) : StreamEvent()
-        data class Error(val code: String, val message: String) : StreamEvent()
-        object Complete : StreamEvent()
+    private sealed interface StreamEvent {
+        data class Data(val chunk: String) : StreamEvent
+        data class Error(val code: String, val message: String) : StreamEvent
+        data object Complete : StreamEvent
     }
 
+    private val channel = Channel<StreamEvent>(Channel.UNLIMITED)
+    private val terminal = AtomicBoolean(false)
+
     fun onChunk(chunk: String) {
-        channel.trySend(StreamEvent.Data(chunk))
+        if (!terminal.get()) channel.trySend(StreamEvent.Data(chunk))
     }
 
     fun onComplete() {
-        channel.trySend(StreamEvent.Complete)
-        channel.close()
+        if (terminal.compareAndSet(false, true)) {
+            channel.trySend(StreamEvent.Complete)
+            channel.close()
+        }
     }
 
     fun onError(errorCode: String, errorMessage: String) {
-        channel.trySend(StreamEvent.Error(errorCode, errorMessage))
-        channel.close()
-    }
-
-    fun createResponseBody(): ResponseBody {
-        return object : ResponseBody() {
-
-            override fun contentType() =
-                "text/event-stream".toMediaType()
-
-            override fun contentLength() = -1L
-
-            override fun source(): BufferedSource {
-                val pipeSource = PipeSource(channel, requestId, serviceConnector)
-                return pipeSource.source().buffer()
-            }
+        if (terminal.compareAndSet(false, true)) {
+            channel.trySend(StreamEvent.Error(errorCode, errorMessage))
+            channel.close()
         }
     }
 
-    fun cancel() {
-        channel.close(StreamCancelledException())
-        try {
-            serviceConnector.getService().cancelStream(requestId)
-        } catch (_: Exception) {}
+    fun createResponseBody(): ResponseBody = object : ResponseBody() {
+        override fun contentType(): MediaType? = mediaType
+
+        override fun contentLength(): Long = -1L
+
+        override fun source(): BufferedSource = PipeSource().buffer()
     }
 
-    private class PipeSource(
-        private val channel: Channel<StreamEvent>,
-        private val requestId: String,
-        private val serviceConnector: ServiceConnector
-    ) {
-        fun source(): okio.Source {
-            return object : okio.Source {
+    private inner class PipeSource : Source {
+        private var currentData: ByteArray? = null
+        private var currentPosition = 0
+        private var closed = false
 
-                private var currentData: ByteArray? = null
-                private var currentPos = 0
-                private var closed = false
-
-                override fun read(sink: okio.Buffer, byteCount: Long): Long {
-                    if (closed) return -1L
-
-                    if (currentData == null || currentPos >= currentData!!.size) {
-                        currentData = nextChunk() ?: return -1L
-                        currentPos = 0
-                    }
-
-                    val remaining = currentData!!.size - currentPos
-                    val toWrite = minOf(byteCount.toInt(), remaining).toLong()
-
-                    if (toWrite <= 0) return -1L
-
-                    sink.write(currentData!!, currentPos, toWrite.toInt())
-                    currentPos += toWrite.toInt()
-                    return toWrite
+        override fun read(sink: okio.Buffer, byteCount: Long): Long {
+            require(byteCount >= 0) { "byteCount < 0: $byteCount" }
+            if (closed) throw IllegalStateException("closed")
+            if (byteCount == 0L) return 0L
+            if (isCallCancelled()) {
+                terminal.set(true)
+                try {
+                    cancelStream()
+                } catch (_: Exception) {
                 }
+                throw StreamCancelledException()
+            }
 
-                override fun timeout() = okio.Timeout.NONE
+            if (currentData == null || currentPosition >= currentData!!.size) {
+                currentData = nextChunk() ?: return -1L
+                currentPosition = 0
+            }
 
-                override fun close() {
-                    if (!closed) {
-                        closed = true
-                        cancelStream()
-                    }
+            val remaining = currentData!!.size - currentPosition
+            val toWrite = minOf(byteCount, remaining.toLong()).toInt()
+            sink.write(currentData!!, currentPosition, toWrite)
+            currentPosition += toWrite
+            return toWrite.toLong()
+        }
+
+        override fun timeout(): Timeout = Timeout.NONE
+
+        override fun close() {
+            if (closed) return
+            closed = true
+            channel.cancel()
+            if (!terminal.get()) {
+                try {
+                    cancelStream()
+                } catch (_: Exception) {
                 }
+            }
+        }
 
-                private fun nextChunk(): ByteArray? {
-                    val event = try {
-                        kotlinx.coroutines.runBlocking {
-                            channel.receive()
-                        }
-                    } catch (e: Exception) {
-                        return null
-                    }
-
-                    return when (event) {
-                        is StreamEvent.Data -> event.chunk.encodeUtf8().toByteArray()
-                        is StreamEvent.Error -> {
-                            val errorJson = """{"error":{"code":"${event.code}","message":"${event.message}"}}"""
-                            "data: $errorJson\n\n".encodeUtf8().toByteArray()
-                        }
-                        is StreamEvent.Complete -> {
-                            closed = true
-                            "data: [DONE]\n\n".encodeUtf8().toByteArray()
-                        }
-                    }
-                }
-
-                private fun cancelStream() {
+        private fun nextChunk(): ByteArray? {
+            var event: StreamEvent? = null
+            while (event == null) {
+                if (isCallCancelled()) {
+                    terminal.set(true)
                     try {
-                        serviceConnector.getService().cancelStream(requestId)
-                    } catch (_: Exception) {}
+                        cancelStream()
+                    } catch (_: Exception) {
+                    }
+                    throw StreamCancelledException()
                 }
+                val result = kotlinx.coroutines.runBlocking {
+                    withTimeoutOrNull(CANCEL_POLL_INTERVAL_MS) {
+                        channel.receiveCatching()
+                    }
+                } ?: continue
+                if (result.isClosed) return null
+                event = result.getOrThrow()
+            }
+
+            return when (event) {
+                is StreamEvent.Data -> event.chunk.toByteArray(Charsets.UTF_8)
+                is StreamEvent.Error -> throw TokenFamilyException(event.code, event.message)
+                StreamEvent.Complete -> null
             }
         }
+    }
+
+    companion object {
+        private const val CANCEL_POLL_INTERVAL_MS = 250L
     }
 }

@@ -8,175 +8,167 @@ import kotlinx.coroutines.Job
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.withContext
-import kotlinx.coroutines.yield
+import okhttp3.Call
 import okhttp3.OkHttpClient
-import okhttp3.Request
-import okhttp3.MediaType.Companion.toMediaType
-import okhttp3.RequestBody.Companion.toRequestBody
+import okhttp3.Response
 import top.ntutn.tokenfamily.aidl.ChatCompletionRequest
+import top.ntutn.tokenfamily.aidl.ChatCompletionResponse
 import top.ntutn.tokenfamily.aidl.IChatStreamCallback
 import top.ntutn.tokenfamily.data.model.ApiKeyConfig
+import java.io.IOException
 import java.util.concurrent.ConcurrentHashMap
-import java.util.concurrent.TimeUnit
 
-class StreamForwarder {
+class StreamForwarder(
+    private val okHttpClient: OkHttpClient = RequestForwarder.defaultClient(),
+    private val scope: CoroutineScope = CoroutineScope(Dispatchers.IO)
+) {
 
     private data class StreamSession(
         val requestId: String,
         val callback: IChatStreamCallback,
         val deathRecipient: IBinder.DeathRecipient,
-        var httpCall: okhttp3.Call? = null,
+        var httpCall: Call? = null,
+        var response: Response? = null,
         var job: Job? = null
     )
 
     private val sessions = ConcurrentHashMap<String, StreamSession>()
+    private val requestForwarder = RequestForwarder(okHttpClient)
 
-    private val okHttpClient = OkHttpClient.Builder()
-        .connectTimeout(30, TimeUnit.SECONDS)
-        .readTimeout(120, TimeUnit.SECONDS)
-        .writeTimeout(30, TimeUnit.SECONDS)
-        .build()
-
-    @kotlinx.coroutines.ExperimentalCoroutinesApi
-    fun startStream(
-        requestId: String,
+    fun openStream(
         request: ChatCompletionRequest,
         apiKeyConfig: ApiKeyConfig,
         callback: IChatStreamCallback
-    ) {
-        val deathRecipient = IBinder.DeathRecipient {
-            cancelStream(requestId)
+    ): ChatCompletionResponse {
+        val requestId = request.requestId.ifBlank { java.util.UUID.randomUUID().toString() }
+        val bodyJson = try {
+            requestForwarder.prepareBody(request.bodyJson, apiKeyConfig.defaultModel)
+        } catch (e: IllegalArgumentException) {
+            return RequestForwarder.errorResponse(
+                400,
+                "INVALID_REQUEST",
+                e.message ?: "Invalid JSON request"
+            )
         }
 
+        val deathRecipient = IBinder.DeathRecipient { cancelStream(requestId) }
         try {
-            (callback as android.os.IInterface).asBinder().linkToDeath(deathRecipient, 0)
+            callback.asBinder().linkToDeath(deathRecipient, 0)
         } catch (e: Exception) {
-            callback.onError(requestId, "CLIENT_DEAD", "Client already disconnected")
-            return
+            return RequestForwarder.errorResponse(503, "CLIENT_DEAD", "Client already disconnected")
         }
 
-        val session = StreamSession(
-            requestId = requestId,
-            callback = callback,
-            deathRecipient = deathRecipient
-        )
-
+        val session = StreamSession(requestId, callback, deathRecipient)
         sessions[requestId] = session
 
-        val job = CoroutineScope(Dispatchers.IO).launch {
-            try {
-                executeStream(requestId, request, apiKeyConfig, session)
-            } catch (e: CancellationException) {
-                cleanupSession(requestId)
-            } catch (e: Exception) {
-                try {
-                    callback.onError(requestId, "STREAM_ERROR", e.message ?: "Stream error")
-                } catch (_: Exception) {}
-                cleanupSession(requestId)
-            }
+        val call = okHttpClient.newCall(
+            requestForwarder.buildHttpRequest(request, apiKeyConfig, bodyJson)
+        )
+        session.httpCall = call
+        if (sessions[requestId] !== session) {
+            call.cancel()
+            return RequestForwarder.errorResponse(503, "CLIENT_DEAD", "Client already disconnected")
         }
 
-        session.job = job
-    }
-
-    private suspend fun executeStream(
-        requestId: String,
-        request: ChatCompletionRequest,
-        apiKeyConfig: ApiKeyConfig,
-        session: StreamSession
-    ) = withContext(Dispatchers.IO) {
-        val requestBody = buildStreamRequestBody(request, apiKeyConfig)
-        val httpRequest = Request.Builder()
-            .url(ChatCompletionUrl.normalize(apiKeyConfig.apiBaseUrl))
-            .addHeader("Authorization", "Bearer ${apiKeyConfig.apiKey}")
-            .addHeader("Content-Type", "application/json")
-            .post(requestBody)
-            .build()
-
-        val call = okHttpClient.newCall(httpRequest)
-        session.httpCall = call
-
-        val response = call.execute()
+        val response = try {
+            call.execute()
+        } catch (e: IOException) {
+            cleanupSession(requestId)
+            return RequestForwarder.errorResponse(
+                502,
+                "NETWORK_ERROR",
+                e.message ?: "Upstream network error"
+            )
+        }
 
         if (!response.isSuccessful) {
-            val errorBody = response.body?.string()
-            session.callback.onError(requestId, "UPSTREAM_ERROR", errorBody ?: "HTTP ${response.code}")
-            cleanupSession(requestId)
-            return@withContext
-        }
-
-        val source = response.body?.source() ?: run {
-            session.callback.onError(requestId, "EMPTY_RESPONSE", "Empty response body")
-            cleanupSession(requestId)
-            return@withContext
-        }
-
-        source.use { bufferedSource ->
-            while (!bufferedSource.exhausted() && currentCoroutineContext().isActive) {
-                val line = bufferedSource.readUtf8Line() ?: break
-
-                if (currentCoroutineContext().isActive) {
-                    try {
-                        session.callback.onChunk(requestId, "$line\n")
-                    } catch (e: Exception) {
-                        cleanupSession(requestId)
-                        return@withContext
-                    }
-                } else {
-                    break
+            response.use {
+                val result = with(RequestForwarder) {
+                    it.toAidlResponse(it.body?.string().orEmpty())
                 }
-                yield()
+                cleanupSession(requestId)
+                return result
             }
         }
 
-        if (currentCoroutineContext().isActive) {
-            try {
-                session.callback.onComplete(requestId)
-            } catch (_: Exception) {}
+        if (response.body == null) {
+            response.close()
+            cleanupSession(requestId)
+            return RequestForwarder.errorResponse(502, "EMPTY_RESPONSE", "Empty upstream response body")
         }
 
-        cleanupSession(requestId)
+        session.response = response
+        val metadata = with(RequestForwarder) { response.toAidlResponse() }
+        session.job = scope.launch { relayStream(session) }
+        return metadata
     }
 
-    private fun buildStreamRequestBody(
-        request: ChatCompletionRequest,
-        apiKeyConfig: ApiKeyConfig
-    ) = com.google.gson.Gson().toJson(
-        mapOf<String, Any>(
-            "model" to request.model.ifEmpty { apiKeyConfig.defaultModel },
-            "messages" to (request.messages?.map {
-                mapOf("role" to it.role, "content" to it.content)
-            } ?: emptyList<Map<String, String>>()),
-            "temperature" to request.temperature,
-            "top_p" to request.topP,
-            "max_tokens" to request.maxTokens,
-            "stream" to true
-        )
-    ).toRequestBody("application/json; charset=utf-8".toMediaType())
+    private suspend fun relayStream(session: StreamSession) {
+        val response = session.response ?: return
+        try {
+            response.body!!.source().use { source ->
+                while (!source.exhausted() && currentCoroutineContext().isActive) {
+                    val line = source.readUtf8Line() ?: break
+                    emitChunked(session, "$line\n")
+                }
+            }
+            if (currentCoroutineContext().isActive) {
+                session.callback.onComplete(session.requestId)
+            }
+        } catch (_: CancellationException) {
+            // Explicit cancellation is a normal terminal state.
+        } catch (e: Exception) {
+            try {
+                session.callback.onError(
+                    session.requestId,
+                    "STREAM_ERROR",
+                    e.message ?: "Stream interrupted"
+                )
+            } catch (_: Exception) {
+            }
+        } finally {
+            cleanupSession(session.requestId)
+        }
+    }
+
+    private fun emitChunked(session: StreamSession, value: String) {
+        var start = 0
+        while (start < value.length) {
+            var end = minOf(start + MAX_STREAM_CHUNK_CHARS, value.length)
+            if (end < value.length && end > start && value[end - 1].isHighSurrogate()) {
+                end--
+            }
+            session.callback.onChunk(session.requestId, value.substring(start, end))
+            start = end
+        }
+    }
 
     fun cancelStream(requestId: String) {
         val session = sessions.remove(requestId) ?: return
         unlinkDeath(session)
         session.httpCall?.cancel()
+        session.response?.close()
         session.job?.cancel()
     }
 
     fun cancelAllStreams() {
-        sessions.keys.toList().forEach { requestId ->
-            cancelStream(requestId)
-        }
+        sessions.keys.toList().forEach(::cancelStream)
     }
 
     private fun cleanupSession(requestId: String) {
         val session = sessions.remove(requestId) ?: return
         unlinkDeath(session)
-        session.job?.cancel()
+        session.response?.close()
     }
 
     private fun unlinkDeath(session: StreamSession) {
         try {
-            (session.callback as android.os.IInterface).asBinder().unlinkToDeath(session.deathRecipient, 0)
-        } catch (_: Exception) {}
+            session.callback.asBinder().unlinkToDeath(session.deathRecipient, 0)
+        } catch (_: Exception) {
+        }
+    }
+
+    companion object {
+        private const val MAX_STREAM_CHUNK_CHARS = 16 * 1024
     }
 }

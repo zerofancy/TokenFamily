@@ -1,12 +1,10 @@
 package top.ntutn.tokenfamily.aidl;
 
 parcelable ChatCompletionResponse {
-    String id;
-    String model;
-    String content;
-    int promptTokens;
-    int completionTokens;
-    int totalTokens;
-    String errorCode;
-    String errorMessage;
+    int statusCode;
+    String statusMessage;
+    String contentType;
+    String body;
+    List<String> headerNames;
+    List<String> headerValues;
 }

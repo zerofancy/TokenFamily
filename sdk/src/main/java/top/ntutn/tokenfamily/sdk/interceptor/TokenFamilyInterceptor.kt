@@ -1,82 +1,69 @@
 package top.ntutn.tokenfamily.sdk.interceptor
 
+import android.os.DeadObjectException
+import android.os.RemoteException
 import com.google.gson.Gson
-import com.google.gson.JsonObject
-import kotlinx.coroutines.runBlocking
+import okhttp3.Headers
 import okhttp3.Interceptor
-import okhttp3.MediaType.Companion.toMediaType
+import okhttp3.MediaType.Companion.toMediaTypeOrNull
 import okhttp3.Protocol
+import okhttp3.Request
 import okhttp3.Response
 import okhttp3.ResponseBody.Companion.toResponseBody
+import top.ntutn.tokenfamily.aidl.ChatCompletionRequest
 import top.ntutn.tokenfamily.aidl.ChatCompletionResponse
 import top.ntutn.tokenfamily.aidl.IChatStreamCallback
 import top.ntutn.tokenfamily.sdk.binder.BinderRequestConverter
 import top.ntutn.tokenfamily.sdk.binder.ServiceConnector
 import top.ntutn.tokenfamily.sdk.binder.StreamResponseWrapper
+import top.ntutn.tokenfamily.sdk.exception.PayloadTooLargeException
 import top.ntutn.tokenfamily.sdk.exception.TokenFamilyException
 
 class TokenFamilyInterceptor(
     private val serviceConnector: ServiceConnector
 ) : Interceptor {
 
-    private val gson = Gson()
     private val requestConverter = BinderRequestConverter()
-    private val jsonMediaType = "application/json; charset=utf-8".toMediaType()
-    private val sseMediaType = "text/event-stream".toMediaType()
 
     override fun intercept(chain: Interceptor.Chain): Response {
-        val request = chain.request()
+        val originalRequest = chain.request()
+        if (!isChatCompletionRequest(originalRequest)) return chain.proceed(originalRequest)
 
-        if (!isChatCompletionRequest(request)) {
-            return chain.proceed(request)
+        val converted = try {
+            requestConverter.toChatCompletionRequest(originalRequest)
+        } catch (e: PayloadTooLargeException) {
+            throw e
+        } catch (e: IllegalArgumentException) {
+            return localErrorResponse(originalRequest, 400, "INVALID_REQUEST", e.message ?: "Invalid request")
         }
 
-        ensureServiceBound()
-
-        val binderRequest = requestConverter.toChatCompletionRequest(request)
-
-        return if (binderRequest.stream) {
-            handleStreamRequest(request, binderRequest)
+        serviceConnector.connect()
+        return if (converted.isStream) {
+            handleStreamRequest(originalRequest, converted.binderRequest) {
+                chain.call().isCanceled()
+            }
         } else {
-            handleNonStreamRequest(request, binderRequest)
+            handleNonStreamRequest(originalRequest, converted.binderRequest)
         }
     }
 
     private fun handleNonStreamRequest(
-        originalRequest: okhttp3.Request,
-        request: top.ntutn.tokenfamily.aidl.ChatCompletionRequest
+        originalRequest: Request,
+        request: ChatCompletionRequest
     ): Response {
-        val service = serviceConnector.getService()
-        val response: ChatCompletionResponse = service.chat(request)
-
-        if (response.errorCode.isNotEmpty()) {
-            throw TokenFamilyException(response.errorCode, response.errorMessage)
-        }
-
-        val jsonResponse = buildSuccessJson(response)
-        val responseBody = jsonResponse.toResponseBody(jsonMediaType)
-
-        return Response.Builder()
-            .request(originalRequest)
-            .protocol(Protocol.HTTP_1_1)
-            .code(200)
-            .message("OK")
-            .body(responseBody)
-            .build()
+        val response = binderCall { serviceConnector.getService().chat(request) }
+        return response.toHttpResponse(originalRequest)
     }
 
     private fun handleStreamRequest(
-        originalRequest: okhttp3.Request,
-        request: top.ntutn.tokenfamily.aidl.ChatCompletionRequest
+        originalRequest: Request,
+        request: ChatCompletionRequest,
+        isCallCancelled: () -> Boolean
     ): Response {
-        val service = serviceConnector.getService()
-        val wrapper = StreamResponseWrapper(request.requestId, serviceConnector)
-
+        lateinit var wrapper: StreamResponseWrapper
         val callback = object : IChatStreamCallback.Stub() {
             override fun onChunk(requestId: String?, chunk: String?) {
-                if (chunk != null) {
-                    wrapper.onChunk(chunk)
-                }
+                if (chunk != null) wrapper.onChunk(chunk)
             }
 
             override fun onComplete(requestId: String?) {
@@ -84,56 +71,97 @@ class TokenFamilyInterceptor(
             }
 
             override fun onError(requestId: String?, errorCode: String?, errorMessage: String?) {
-                wrapper.onError(errorCode ?: "UNKNOWN", errorMessage ?: "Unknown error")
+                wrapper.onError(errorCode ?: "STREAM_ERROR", errorMessage ?: "Stream interrupted")
             }
         }
 
-        service.streamChat(request, callback)
+        wrapper = StreamResponseWrapper(
+            cancelStream = {
+                serviceConnector.getService().cancelStream(request.requestId)
+            },
+            isCallCancelled = isCallCancelled,
+            mediaType = "text/event-stream".toMediaTypeOrNull()
+        )
 
-        val responseBody = wrapper.createResponseBody()
+        val metadata = binderCall {
+            serviceConnector.getService().streamChat(request, callback)
+        }
+        if (metadata.statusCode !in 200..299) {
+            return metadata.toHttpResponse(originalRequest)
+        }
 
+        return metadata.toHttpResponse(
+            originalRequest = originalRequest,
+            streamingBody = wrapper.createResponseBody()
+        )
+    }
+
+    private fun <T> binderCall(block: () -> T): T = try {
+        block()
+    } catch (e: DeadObjectException) {
+        serviceConnector.invalidateConnection()
+        throw TokenFamilyException("IPC_DISCONNECTED", "词元芯核服务连接已中断", e)
+    } catch (e: RemoteException) {
+        serviceConnector.invalidateConnection()
+        throw TokenFamilyException("IPC_ERROR", e.message ?: "Binder 调用失败", e)
+    }
+
+    private fun ChatCompletionResponse.toHttpResponse(
+        originalRequest: Request,
+        streamingBody: okhttp3.ResponseBody? = null
+    ): Response {
+        val code = statusCode.takeIf { it in 100..599 } ?: 502
+        val mediaType = contentType?.toMediaTypeOrNull()
+        val responseBody = streamingBody ?: (body ?: "").toResponseBody(mediaType)
         return Response.Builder()
             .request(originalRequest)
             .protocol(Protocol.HTTP_1_1)
-            .code(200)
-            .message("OK")
-            .header("Content-Type", "text/event-stream")
+            .code(code)
+            .message(statusMessage?.takeIf { it.isNotBlank() } ?: "HTTP $code")
+            .headers(safeHeaders(headerNames, headerValues))
             .body(responseBody)
             .build()
     }
 
-    private fun ensureServiceBound() {
-        serviceConnector.connect()
-    }
-
-    private fun isChatCompletionRequest(request: okhttp3.Request): Boolean {
-        val url = request.url.toString()
-        return url.contains("/v1/chat/completions") ||
-                url.contains("/chat/completions")
-    }
-
-    private fun buildSuccessJson(response: ChatCompletionResponse): String {
-        val json = JsonObject().apply {
-            addProperty("id", response.id)
-            addProperty("object", "chat.completion")
-            addProperty("model", response.model)
-            addProperty("created", System.currentTimeMillis() / 1000)
-            add("choices", com.google.gson.JsonArray().apply {
-                add(JsonObject().apply {
-                    addProperty("index", 0)
-                    add("message", JsonObject().apply {
-                        addProperty("role", "assistant")
-                        addProperty("content", response.content)
-                    })
-                    addProperty("finish_reason", "stop")
-                })
-            })
-            add("usage", JsonObject().apply {
-                addProperty("prompt_tokens", response.promptTokens)
-                addProperty("completion_tokens", response.completionTokens)
-                addProperty("total_tokens", response.totalTokens)
-            })
+    private fun safeHeaders(names: List<String>?, values: List<String>?): Headers {
+        val builder = Headers.Builder()
+        (names ?: emptyList()).zip(values ?: emptyList()).forEach { (name, value) ->
+            try {
+                builder.add(name, value)
+            } catch (_: IllegalArgumentException) {
+            }
         }
-        return gson.toJson(json)
+        return builder.build()
+    }
+
+    private fun localErrorResponse(
+        request: Request,
+        statusCode: Int,
+        code: String,
+        message: String
+    ): Response {
+        val body = Gson().toJson(
+            mapOf(
+                "error" to mapOf(
+                    "type" to "tokenfamily_error",
+                    "code" to code,
+                    "message" to message
+                )
+            )
+        )
+        val mediaType = "application/json; charset=utf-8".toMediaTypeOrNull()
+        return Response.Builder()
+            .request(request)
+            .protocol(Protocol.HTTP_1_1)
+            .code(statusCode)
+            .message(if (statusCode == 400) "Bad Request" else "HTTP $statusCode")
+            .header("Content-Type", mediaType.toString())
+            .body(body.toResponseBody(mediaType))
+            .build()
+    }
+
+    private fun isChatCompletionRequest(request: Request): Boolean {
+        val path = request.url.encodedPath
+        return path.endsWith("/v1/chat/completions") || path.endsWith("/chat/completions")
     }
 }

@@ -1,77 +1,85 @@
 package top.ntutn.tokenfamily.sdk.binder
 
+import com.google.gson.JsonParser
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
+import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
+import org.junit.Assert.assertTrue
 import org.junit.Test
-import org.junit.Assert.*
+import top.ntutn.tokenfamily.sdk.exception.PayloadTooLargeException
 
 class BinderRequestConverterTest {
 
     private val converter = BinderRequestConverter()
 
     @Test
-    fun `test convert non-streaming request`() {
+    fun `preserves agent request JSON and filters sensitive headers`() {
         val json = """
-        {
-            "model": "gpt-4",
-            "messages": [
-                {"role": "user", "content": "Hello"}
-            ],
-            "temperature": 0.7,
-            "top_p": 0.9,
-            "max_tokens": 100,
-            "stream": false
-        }
+            {
+              "model":"agent-model",
+              "messages":[
+                {"role":"user","content":[{"type":"text","text":"write"}]},
+                {"role":"tool","tool_call_id":"call_1","content":"done"}
+              ],
+              "tools":[{"type":"function","function":{"name":"write_chapter","parameters":{"type":"object"}}}],
+              "tool_choice":"auto",
+              "response_format":{"type":"json_object"},
+              "stream_options":{"include_usage":true},
+              "provider_extension":{"enabled":true},
+              "stream":true
+            }
         """.trimIndent()
-
         val request = Request.Builder()
             .url("https://api.openai.com/v1/chat/completions")
+            .header("Authorization", "Bearer must-not-leak")
+            .header("Cookie", "secret=1")
+            .header("OpenAI-Project", "project-1")
             .post(json.toRequestBody("application/json".toMediaType()))
             .build()
 
-        val result = converter.toChatCompletionRequest(request)
+        val converted = converter.toChatCompletionRequest(request)
 
-        assertNotNull(result.requestId)
-        assertEquals("gpt-4", result.model)
-        assertEquals(false, result.stream)
-        assertEquals(0.7, result.temperature, 0.001)
-        assertEquals(0.9, result.topP, 0.001)
-        assertEquals(100, result.maxTokens)
-        assertEquals(1, result.messages?.size)
-        assertEquals("user", result.messages?.get(0)?.role)
-        assertEquals("Hello", result.messages?.get(0)?.content)
+        assertTrue(converted.isStream)
+        assertEquals(
+            JsonParser.parseString(json),
+            JsonParser.parseString(converted.binderRequest.bodyJson)
+        )
+        assertEquals(listOf("OpenAI-Project"), converted.binderRequest.headerNames)
+        assertEquals(listOf("project-1"), converted.binderRequest.headerValues)
     }
 
     @Test
-    fun `test convert streaming request`() {
-        val json = """
-        {
-            "model": "gpt-3.5-turbo",
-            "messages": [],
-            "stream": true
-        }
-        """.trimIndent()
+    fun `defaults stream to false without changing body`() {
+        val json = """{"model":"gpt-4","messages":[],"unknown":42}"""
+        val request = Request.Builder()
+            .url("https://api.openai.com/chat/completions")
+            .post(json.toRequestBody("application/json".toMediaType()))
+            .build()
 
+        val converted = converter.toChatCompletionRequest(request)
+
+        assertFalse(converted.isStream)
+        assertEquals(json, converted.binderRequest.bodyJson)
+    }
+
+    @Test(expected = IllegalArgumentException::class)
+    fun `rejects non object JSON`() {
+        val request = Request.Builder()
+            .url("https://api.openai.com/v1/chat/completions")
+            .post("[]".toRequestBody("application/json".toMediaType()))
+            .build()
+        converter.toChatCompletionRequest(request)
+    }
+
+    @Test(expected = PayloadTooLargeException::class)
+    fun `rejects payload above Binder safety limit`() {
+        val json = """{"messages":[{"role":"user","content":"${"x".repeat(BinderRequestConverter.MAX_BINDER_BODY_BYTES)}"}]}"""
         val request = Request.Builder()
             .url("https://api.openai.com/v1/chat/completions")
             .post(json.toRequestBody("application/json".toMediaType()))
             .build()
-
-        val result = converter.toChatCompletionRequest(request)
-
-        assertTrue(result.stream)
-        assertEquals("gpt-3.5-turbo", result.model)
-        assertTrue(result.messages?.isEmpty() ?: false)
-    }
-
-    @Test(expected = IllegalArgumentException::class)
-    fun `test empty body throws exception`() {
-        val request = Request.Builder()
-            .url("https://api.openai.com/v1/chat/completions")
-            .get()
-            .build()
-
         converter.toChatCompletionRequest(request)
     }
 }

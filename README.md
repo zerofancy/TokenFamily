@@ -1,119 +1,78 @@
 # TokenFamily / 词元芯核
 
-面向 Android 平台的开源 AI 中间件，基于 Binder IPC 实现跨进程 Chat Completions 转发，兼容 OpenAI 接口格式，支持流式（SSE）和非流式两种模式。
-
-## 架构
-
-```
-┌──────────────────────────┐     ┌────────────────────────────┐
-│   第三方 App (Demo)       │     │   词元芯核 App (:app)        │
-│                          │     │                            │
-│  OkHttp + Interceptor ───┼─────┼──► AIDL Service           │
-│  TokenFamily SDK (:sdk)  │Binder│   ├─ 密钥加密存储           │
-│                          │IPC  │   ├─ 请求鉴权               │
-└──────────────────────────┘     │   └─ OkHttp → 上游模型      │
-                                 └────────────────────────────┘
-```
-
-## 文档
-
-| 文档 | 说明 |
-|------|------|
-| [README.md](README.md) | 项目总览、架构与快速开始 |
-| [SDK.md](SDK.md) | 第三方接入 SDK 的完整文档（初始化、请求、流式、错误码） |
-| [AGENTS.md](AGENTS.md) | 开发者指南（构建命令、模块结构、架构约束） |
-| [LICENSE](LICENSE) | MIT 许可证 |
+TokenFamily 是面向 Android 的开源 AI 中间件。第三方应用继续使用 OkHttp 和 OpenAI Chat Completions 请求格式，API Key、应用授权与上游转发由独立的词元芯核 App 统一管理。
 
 ## 模块
 
-| 模块 | 类型 | 说明 |
-|------|------|------|
-| `:app` | Android Application | 核心管理 App，密钥存储、AIDL 服务、请求转发 |
-| `:sdk` | Android Library | 开发者 SDK，OkHttp Interceptor 接入 |
-| `:demo` | Android Application | SDK 接入演示 App |
+| 模块 | 说明 |
+|---|---|
+| `:app` | 密钥管理、应用授权、Binder 服务与上游 HTTP 转发 |
+| `:sdk` | 第三方 Android 应用使用的 OkHttp Interceptor SDK |
+| `:demo` | 流式与非流式聊天示例 |
+
+## 数据流
+
+```text
+第三方 App (OkHttp)
+  -> TokenFamilyInterceptor
+  -> Binder IPC
+  -> 词元芯核 App
+  -> 使用托管 API Key 请求上游模型
+```
 
 ## 快速开始
 
-### 1. 安装词元芯核 App
+先安装并打开词元芯核 App，添加 API Key 配置：
 
 ```bash
 ./gradlew :app:assembleDebug
 adb install app/build/outputs/apk/debug/app-debug.apk
 ```
 
-打开词元芯核 App，在「密钥管理」中添加 API Key 配置。
-
-### 2. 安装 Demo App
-
-```bash
-./gradlew :demo:assembleDebug
-adb install demo/build/outputs/apk/debug/demo-debug.apk
-```
-
-打开 Demo App，输入消息发送测试。
-
-### 3. 在自己的 App 中接入 SDK
-
-SDK 已发布到 Maven Central，坐标：`top.ntutn:tokenfamily-sdk`。
+在第三方应用中添加 SDK 0.2.0：
 
 ```kotlin
-// app/build.gradle.kts
 dependencies {
-    implementation("top.ntutn:tokenfamily-sdk:0.1.0")
+    implementation("top.ntutn:tokenfamily-sdk:0.2.0")
     implementation("com.squareup.okhttp3:okhttp:4.12.0")
 }
-
-// Application.onCreate()
-TokenFamily.init(this)
-
-// 创建带拦截器的 OkHttpClient
-val interceptor = TokenFamilyInterceptor(TokenFamily.getServiceConnector())
-val client = OkHttpClient.Builder()
-    .addInterceptor(interceptor)
-    .build()
-
-// 业务代码完全不变
-val request = Request.Builder()
-    .url("https://api.openai.com/v1/chat/completions")
-    .post(...)
-    .build()
-client.newCall(request).execute()  // 自动通过 词元芯核 转发
 ```
 
-## 核心特性
+初始化并安装拦截器：
 
-- **Binder 内核级鉴权**：基于 UID 的应用身份识别
-- **密钥安全存储**：Android Keystore + EncryptedSharedPreferences
-- **OpenAI 兼容**：SDK 层 100% 对齐 OpenAI Chat Completions API
-- **流式支持**：SSE 实时推流，支持中途取消
-- **进程保活**：前台服务常驻通知，客户端死亡自动释放
-- **SDK 轻量**：仅依赖 OkHttp + Coroutines
+```kotlin
+TokenFamily.init(applicationContext)
 
-## 技术栈
+val client = OkHttpClient.Builder()
+    .addInterceptor(
+        TokenFamilyInterceptor(TokenFamily.getServiceConnector())
+    )
+    .build()
+```
 
-- Kotlin 2.2
-- AGP 9.3 / Gradle 9.5
-- Jetpack Compose (Material 3)
-- OkHttp 4.12
-- AndroidX Security Crypto
+之后仍向 `/v1/chat/completions` 发起请求。SDK 会透明传递 JSON 请求体和响应体，包括 `tools`、`tool_choice`、多模态消息、`response_format`、`stream_options` 及供应商扩展字段。
 
-## 最低兼容
+> SDK 与词元芯核 App 的 0.2.x AIDL 协议不兼容 0.1.x，请同步升级。
 
-Android API 26 (Android 8.0)
+## 兼容范围
+
+- Android API 26+。
+- 消费方最低 `compileSdk` 为 30；不要求跟随词元芯核项目使用 API 37。
+- 支持 OpenAI 风格 Chat Completions 的流式和非流式请求。
+- 请求中缺少 `model` 或值为空时，词元芯核会填入所选密钥配置的默认模型；其他 JSON 字段不会重建。
+- 上游 HTTP 状态码、错误体、Content-Type 和安全响应头会返回调用方。
+- 不提供 Responses API，也不保证所有上游供应商支持相同模型能力。
 
 ## 开发
 
 ```bash
-# 编译全部模块
-./gradlew assembleDebug
-
-# 运行测试
-./gradlew test
-
-# 安装到设备
-./gradlew :app:installDebug :demo:installDebug
+./gradlew :sdk:test
+./gradlew :app:testDebugUnitTest
+./gradlew :app:assembleDebug :sdk:assembleDebug :demo:assembleDebug
 ```
+
+完整接入、tool calling、SSE、错误与限制说明见 [SDK.md](SDK.md)。
 
 ## 许可证
 
-MIT License — 详见 [LICENSE](LICENSE)
+MIT License，详见 [LICENSE](LICENSE)。

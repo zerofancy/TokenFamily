@@ -1,51 +1,99 @@
 package top.ntutn.tokenfamily.sdk.binder
 
-import com.google.gson.Gson
+import com.google.gson.JsonParser
 import com.google.gson.JsonObject
 import okhttp3.Request
 import okhttp3.RequestBody
 import okio.Buffer
 import top.ntutn.tokenfamily.aidl.ChatCompletionRequest
-import top.ntutn.tokenfamily.aidl.ChatMessage
+import top.ntutn.tokenfamily.sdk.exception.PayloadTooLargeException
 import java.util.UUID
 
 class BinderRequestConverter {
 
-    private val gson = Gson()
+    data class ConvertedRequest(
+        val binderRequest: ChatCompletionRequest,
+        val isStream: Boolean
+    )
 
-    fun toChatCompletionRequest(httpRequest: Request): ChatCompletionRequest {
+    fun toChatCompletionRequest(httpRequest: Request): ConvertedRequest {
         val requestBody = httpRequest.body ?: throw IllegalArgumentException("Request body is required")
-        val json = parseRequestBody(requestBody)
+        val bodyJson = readRequestBody(requestBody)
+        val json = parseRequestBody(bodyJson)
 
         val request = ChatCompletionRequest()
-
         request.requestId = UUID.randomUUID().toString()
-        request.model = json.get("model")?.asString ?: ""
-        request.temperature = json.get("temperature")?.asDouble ?: 1.0
-        request.topP = json.get("top_p")?.asDouble ?: 1.0
-        request.maxTokens = json.get("max_tokens")?.asInt ?: 0
-        request.stream = json.get("stream")?.asBoolean ?: false
+        request.bodyJson = bodyJson
 
-        val messagesArray = json.getAsJsonArray("messages")
-        if (messagesArray != null) {
-            val messages = mutableListOf<ChatMessage>()
-            messagesArray.forEach { element ->
-                val msgObj = element.asJsonObject
-                val chatMsg = ChatMessage()
-                chatMsg.role = msgObj.get("role")?.asString ?: "user"
-                chatMsg.content = msgObj.get("content")?.asString ?: ""
-                messages.add(chatMsg)
+        val names = arrayListOf<String>()
+        val values = arrayListOf<String>()
+        httpRequest.headers.forEach { (name, value) ->
+            if (name.lowercase() !in BLOCKED_REQUEST_HEADERS) {
+                names += name
+                values += value
             }
-            request.messages = messages
         }
+        val binderPayloadBytes = bodyJson.toByteArray(Charsets.UTF_8).size +
+            names.zip(values).sumOf { (name, value) ->
+                name.toByteArray(Charsets.UTF_8).size + value.toByteArray(Charsets.UTF_8).size
+            }
+        if (binderPayloadBytes > MAX_BINDER_BODY_BYTES) {
+            throw PayloadTooLargeException(
+                "请求超过 Binder 安全上限 ${MAX_BINDER_BODY_BYTES / 1024} KiB"
+            )
+        }
+        request.headerNames = names
+        request.headerValues = values
 
-        return request
+        return ConvertedRequest(
+            binderRequest = request,
+            isStream = parseStream(json)
+        )
     }
 
-    private fun parseRequestBody(requestBody: RequestBody): JsonObject {
+    private fun readRequestBody(requestBody: RequestBody): String {
         val buffer = Buffer()
         requestBody.writeTo(buffer)
-        val bodyString = buffer.readUtf8()
-        return gson.fromJson(bodyString, JsonObject::class.java)
+        return buffer.readUtf8()
+    }
+
+    private fun parseRequestBody(bodyJson: String): JsonObject {
+        val element = try {
+            JsonParser.parseString(bodyJson)
+        } catch (e: Exception) {
+            throw IllegalArgumentException("Request body must be valid JSON", e)
+        }
+        if (!element.isJsonObject) {
+            throw IllegalArgumentException("Request body must be a JSON object")
+        }
+        return element.asJsonObject
+    }
+
+    private fun parseStream(json: JsonObject): Boolean {
+        val stream = json.get("stream") ?: return false
+        if (stream.isJsonNull) return false
+        if (!stream.isJsonPrimitive || !stream.asJsonPrimitive.isBoolean) {
+            throw IllegalArgumentException("stream must be a boolean")
+        }
+        return stream.asBoolean
+    }
+
+    companion object {
+        const val MAX_BINDER_BODY_BYTES = 512 * 1024
+
+        private val BLOCKED_REQUEST_HEADERS = setOf(
+            "authorization",
+            "proxy-authorization",
+            "cookie",
+            "host",
+            "content-length",
+            "content-type",
+            "transfer-encoding",
+            "connection",
+            "keep-alive",
+            "upgrade",
+            "te",
+            "trailer"
+        )
     }
 }

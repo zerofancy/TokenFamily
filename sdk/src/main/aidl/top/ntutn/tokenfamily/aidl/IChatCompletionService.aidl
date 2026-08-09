@@ -7,7 +7,7 @@ import top.ntutn.tokenfamily.aidl.IChatStreamCallback;
 interface IChatCompletionService {
     ChatCompletionResponse chat(in ChatCompletionRequest request);
 
-    oneway void streamChat(in ChatCompletionRequest request, IChatStreamCallback callback);
+    ChatCompletionResponse streamChat(in ChatCompletionRequest request, IChatStreamCallback callback);
 
     oneway void cancelStream(String requestId);
 }

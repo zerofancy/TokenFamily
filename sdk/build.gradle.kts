@@ -16,6 +16,10 @@ android {
     defaultConfig {
         minSdk = 26
 
+        aarMetadata {
+            minCompileSdk = 30
+        }
+
         consumerProguardFiles("consumer-rules.pro")
     }
 
@@ -60,7 +64,7 @@ publishing {
         register<MavenPublication>("release") {
             groupId = "top.ntutn"
             artifactId = "tokenfamily-sdk"
-            version = "0.1.0"
+            version = "0.2.0"
 
             afterEvaluate {
                 from(components["release"])

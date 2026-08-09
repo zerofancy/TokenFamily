@@ -326,10 +326,11 @@ private suspend fun handleNonStreamResponse(
     onLoadingChange: (Boolean) -> Unit,
     onStatusChange: (String) -> Unit
 ) {
-    val response = okHttpClient.newCall(request).execute()
-    val body = response.body?.string() ?: ""
-    val content = extractContent(body)
-    response.close()
+    val content = okHttpClient.newCall(request).execute().use { response ->
+        val body = response.body?.string().orEmpty()
+        if (!response.isSuccessful) throw java.io.IOException(extractErrorMessage(body, response.code))
+        extractContent(body)
+    }
 
     onMessagesUpdate(messages + ChatMessage("assistant", content))
     onStatusChange("完成")
@@ -345,7 +346,12 @@ private suspend fun handleStreamResponse(
     onStatusChange: (String) -> Unit
 ) {
     val response = okHttpClient.newCall(request).execute()
+    if (!response.isSuccessful) {
+        val body = response.use { it.body?.string().orEmpty() }
+        throw java.io.IOException(extractErrorMessage(body, response.code))
+    }
     val source = response.body?.source() ?: run {
+        response.close()
         onLoadingChange(false)
         return
     }
@@ -378,6 +384,14 @@ private suspend fun handleStreamResponse(
     onMessagesUpdate(messages + ChatMessage("assistant", streamingContent))
     onStatusChange("完成")
     onLoadingChange(false)
+    response.close()
+}
+
+private fun extractErrorMessage(body: String, statusCode: Int): String = try {
+    val error = com.google.gson.JsonParser.parseString(body).asJsonObject.getAsJsonObject("error")
+    error?.get("message")?.asString ?: "HTTP $statusCode"
+} catch (_: Exception) {
+    body.ifBlank { "HTTP $statusCode" }
 }
 
 private fun extractContent(json: String): String {

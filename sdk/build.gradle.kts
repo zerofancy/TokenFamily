@@ -37,18 +37,18 @@ android {
     buildFeatures {
         aidl = true
     }
-tasks.register<Jar>("dokkaJavadocJar") {
-    description = "Javadoc JAR containing Dokka documentation"
-    dependsOn(tasks.dokkaGeneratePublicationJavadoc)
-    archiveClassifier.set("javadoc")
-    from(tasks.dokkaGeneratePublicationJavadoc.flatMap { it.outputDirectory })
-}
-
-publishing {
+    publishing {
         singleVariant("release") {
             withSourcesJar()
         }
     }
+}
+
+val dokkaJavadocJar = tasks.register<Jar>("dokkaJavadocJar") {
+    description = "Javadoc JAR containing Dokka documentation"
+    dependsOn(tasks.dokkaGeneratePublicationJavadoc)
+    archiveClassifier.set("javadoc")
+    from(tasks.dokkaGeneratePublicationJavadoc.flatMap { it.outputDirectory })
 }
 
 dependencies {
@@ -70,11 +70,14 @@ publishing {
                 from(components["release"])
             }
 
-            artifact(tasks.named("dokkaJavadocJar"))
+            artifact(dokkaJavadocJar)
 
             pom {
                 name.set("TokenFamily SDK")
-                description.set("Android 跨进程 AI 中间件 SDK，基于 Binder IPC 实现 OpenAI 兼容的 Chat Completions 转发与流式输出")
+                description.set(
+                    "Android AI middleware SDK for forwarding OpenAI-compatible Chat Completions " +
+                        "requests and streaming responses over Binder IPC.",
+                )
                 url.set("https://github.com/zerofancy/TokenFamily")
                 licenses {
                     license {
@@ -101,8 +104,13 @@ publishing {
 }
 
 signing {
-    val signingKey: String? by project
-    val signingPassword: String? by project
+    val signingKey = providers.gradleProperty("signingKey")
+        .orElse(providers.environmentVariable("SIGNING_KEY"))
+        .map { it.replace("\\n", "\n") }
+        .orNull
+    val signingPassword = providers.gradleProperty("signingPassword")
+        .orElse(providers.environmentVariable("SIGNING_PASSWORD"))
+        .getOrElse("")
     useInMemoryPgpKeys(signingKey, signingPassword)
     sign(publishing.publications["release"])
 }

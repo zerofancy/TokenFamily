@@ -73,6 +73,8 @@ val client = OkHttpClient.Builder()
 
 完整接入、tool calling、SSE、错误与限制说明见 [SDK.md](SDK.md)。
 
+发布 Maven Central 的凭据配置、签名验证和发布命令见 [PUBLISHING.md](PUBLISHING.md)。
+
 ## 许可证
 
 MIT License，详见 [LICENSE](LICENSE)。

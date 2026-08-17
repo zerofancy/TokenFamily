@@ -8,10 +8,6 @@ class AidlContractSyncTest {
 
     @Test
     fun `app and sdk AIDL contracts are identical`() {
-        val root = generateSequence(
-            File(requireNotNull(System.getProperty("user.dir"))).absoluteFile
-        ) { it.parentFile }
-            .first { File(it, "settings.gradle.kts").isFile }
         val relativePaths = listOf(
             "ChatCompletionRequest.aidl",
             "ChatCompletionResponse.aidl",
@@ -19,9 +15,39 @@ class AidlContractSyncTest {
             "IChatStreamCallback.aidl"
         )
         relativePaths.forEach { fileName ->
-            val appFile = File(root, "app/src/main/aidl/top/ntutn/tokenfamily/aidl/$fileName")
-            val sdkFile = File(root, "sdk/src/main/aidl/top/ntutn/tokenfamily/aidl/$fileName")
+            val appFile = File(projectRoot, "app/src/main/aidl/top/ntutn/tokenfamily/aidl/$fileName")
+            val sdkFile = File(projectRoot, "sdk/src/main/aidl/top/ntutn/tokenfamily/aidl/$fileName")
             assertEquals("AIDL contract differs: $fileName", appFile.readText(), sdkFile.readText())
         }
     }
+
+    @Test
+    fun `listModels is appended after existing service transactions`() {
+        val serviceContract = File(
+            projectRoot,
+            "sdk/src/main/aidl/top/ntutn/tokenfamily/aidl/IChatCompletionService.aidl"
+        ).readText()
+        val declarations = serviceContract
+            .substringAfter("interface IChatCompletionService {")
+            .substringBeforeLast("}")
+            .split(';')
+            .map { it.trim().replace(Regex("\\s+"), " ") }
+            .filter { it.isNotEmpty() }
+
+        assertEquals(
+            listOf(
+                "ChatCompletionResponse chat(in ChatCompletionRequest request)",
+                "ChatCompletionResponse streamChat(in ChatCompletionRequest request, IChatStreamCallback callback)",
+                "oneway void cancelStream(String requestId)",
+                "ChatCompletionResponse listModels()"
+            ),
+            declarations
+        )
+    }
+
+    private val projectRoot: File
+        get() = generateSequence(
+            File(requireNotNull(System.getProperty("user.dir"))).absoluteFile
+        ) { it.parentFile }
+            .first { File(it, "settings.gradle.kts").isFile }
 }

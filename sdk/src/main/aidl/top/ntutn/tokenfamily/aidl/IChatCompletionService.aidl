@@ -10,4 +10,6 @@ interface IChatCompletionService {
     ChatCompletionResponse streamChat(in ChatCompletionRequest request, IChatStreamCallback callback);
 
     oneway void cancelStream(String requestId);
+
+    ChatCompletionResponse listModels();
 }

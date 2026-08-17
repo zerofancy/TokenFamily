@@ -2,22 +2,22 @@
 
 ## 1. 能力与要求
 
-TokenFamily SDK 通过 OkHttp Interceptor 截获 Chat Completions 请求，经 Binder 交给词元芯核 App，并使用 App 中托管的 API Key 请求上游服务。
+TokenFamily SDK 通过 OkHttp Interceptor 截获 Chat Completions 和模型列表请求，经 Binder 交给词元芯核 App。聊天请求使用 App 中托管的 API Key 访问上游，模型列表则直接来自本地密钥配置。
 
 | 项目 | 要求 |
 |---|---|
 | Android 运行版本 | API 26+ |
 | 消费方 compileSdk | 30+ |
-| SDK | `top.ntutn:tokenfamily-sdk:0.2.0` |
-| 词元芯核 App | 必须安装与 SDK 协议匹配的 0.2.x 版本 |
+| SDK | `top.ntutn:tokenfamily-sdk:0.3.0` |
+| 词元芯核 App | 必须安装与 SDK 协议匹配的 0.3.x 版本 |
 
-兼容范围是 OpenAI 风格 Chat Completions 的 JSON 请求体和响应体透传，不代表每个上游供应商或模型都支持相同功能。
+兼容范围包括 OpenAI 风格 Chat Completions 的 JSON 请求体和响应体透传，以及本地可路由模型枚举；不代表每个上游供应商或模型都支持相同功能。
 
 ## 2. 安装与初始化
 
 ```kotlin
 dependencies {
-    implementation("top.ntutn:tokenfamily-sdk:0.2.0")
+    implementation("top.ntutn:tokenfamily-sdk:0.3.0")
     implementation("com.squareup.okhttp3:okhttp:4.12.0")
 }
 ```
@@ -37,7 +37,7 @@ val client = OkHttpClient.Builder()
     .build()
 ```
 
-SDK 只拦截路径以 `/chat/completions` 结尾的请求，其他请求继续使用原 OkHttp 网络链路。
+SDK 拦截路径以 `/chat/completions` 结尾的请求，以及 `GET /v1/models`、`GET /models` 请求。其他方法、模型详情路径和无关请求继续使用原 OkHttp 网络链路。
 
 ## 3. 普通请求
 
@@ -72,7 +72,47 @@ response.use {
 
 `model` 为空时使用词元芯核密钥配置中的默认模型。非空时用于选择匹配配置并原样发送。
 
-## 4. Tool calling
+## 4. 列出本地可用模型
+
+在后台线程执行 `GET /v1/models`（也兼容 `/models`）：
+
+```kotlin
+val request = Request.Builder()
+    .url("https://api.openai.com/v1/models")
+    .get()
+    .build()
+
+val response = withContext(Dispatchers.IO) {
+    client.newCall(request).execute()
+}
+
+response.use {
+    val responseBody = it.body?.string().orEmpty()
+    if (!it.isSuccessful) {
+        // 按正常 HTTP 错误处理状态码和 JSON error body。
+    }
+}
+```
+
+成功响应采用 OpenAI 风格：
+
+```json
+{
+  "object": "list",
+  "data": [
+    {
+      "id": "agent-model",
+      "object": "model",
+      "created": 0,
+      "owned_by": "example-provider"
+    }
+  ]
+}
+```
+
+`data` 只包含词元芯核中各密钥配置的非空“默认模型名”，按配置顺序去重；重复名称保留首个配置的厂商名称。请求不会访问上游，也不会返回 API Key、Base URL 或配置别名。没有已配置模型时返回 `200` 和空数组。
+
+## 5. Tool calling
 
 SDK 不解析或重建工具定义，完整 JSON Schema 会原样送达上游，返回的 `tool_calls` 也不会丢失。
 
@@ -104,7 +144,7 @@ val body = """
 
 是否真正产生原生 tool call 仍取决于所配置的供应商与模型。
 
-## 5. SSE 流式请求
+## 6. SSE 流式请求
 
 设置 `"stream": true`。SDK 会先等待上游响应头：
 
@@ -136,7 +176,7 @@ withContext(Dispatchers.IO) {
 
 关闭 ResponseBody 会取消对应上游流。应始终使用 `use` 或显式 `close()`；保留 `Call` 后也可在外部调用 `cancel()`。
 
-## 6. 错误语义
+## 7. 错误语义
 
 词元芯核服务能生成 HTTP 响应时，采用统一 JSON：
 
@@ -173,7 +213,7 @@ withContext(Dispatchers.IO) {
 - `STREAM_ERROR`
 - `PAYLOAD_TOO_LARGE`
 
-## 7. 请求头与安全
+## 8. 请求头与安全
 
 SDK 使用词元芯核中托管的密钥覆盖 `Authorization`，并过滤以下请求头：
 
@@ -181,11 +221,11 @@ SDK 使用词元芯核中托管的密钥覆盖 `Authorization`，并过滤以下
 - `Host`、`Content-Length`、`Content-Type`
 - Connection、Transfer-Encoding 等 hop-by-hop 头
 
-其他端到端头（例如 `OpenAI-Project`、`Idempotency-Key`）会转发。响应中的 hop-by-hop 头、`Content-Length` 和 `Set-Cookie` 不会跨 Binder 返回。
+聊天请求中的其他端到端头（例如 `OpenAI-Project`、`Idempotency-Key`）会转发。响应中的 hop-by-hop 头、`Content-Length` 和 `Set-Cookie` 不会跨 Binder 返回。模型列表完全在本地生成，不会向任何上游转发请求头。
 
-## 8. Binder 负载限制
+## 9. Binder 负载限制
 
-0.2.x 尚未使用文件描述符传输大请求：
+0.3.x 尚未使用文件描述符传输大请求：
 
 - 请求 JSON 与透传请求头合计上限为 512 KiB，超出时抛出 `PAYLOAD_TOO_LARGE`。
 - 非流式响应体上限为 512 KiB，超出时返回 502 `PAYLOAD_TOO_LARGE`。

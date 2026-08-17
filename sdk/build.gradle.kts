@@ -64,7 +64,7 @@ publishing {
         register<MavenPublication>("release") {
             groupId = "top.ntutn"
             artifactId = "tokenfamily-sdk"
-            version = "0.2.0"
+            version = "0.3.0"
 
             afterEvaluate {
                 from(components["release"])
@@ -75,8 +75,8 @@ publishing {
             pom {
                 name.set("TokenFamily SDK")
                 description.set(
-                    "Android AI middleware SDK for forwarding OpenAI-compatible Chat Completions " +
-                        "requests and streaming responses over Binder IPC.",
+                    "Android AI middleware SDK for forwarding OpenAI-compatible Chat Completions, " +
+                        "streaming responses, and locally configured Models listings over Binder IPC.",
                 )
                 url.set("https://github.com/zerofancy/TokenFamily")
                 licenses {

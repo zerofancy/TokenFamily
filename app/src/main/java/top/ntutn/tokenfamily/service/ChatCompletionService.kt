@@ -193,6 +193,25 @@ class ChatCompletionService : Service() {
         override fun cancelStream(requestId: String) {
             streamForwarder?.cancelStream(requestId)
         }
+
+        override fun listModels(): ChatCompletionResponse {
+            if (!initialized) {
+                return RequestForwarder.errorResponse(503, "SERVICE_ERROR", "Service not initialized")
+            }
+
+            val callingUid = Binder.getCallingUid()
+            val auth = authManager
+                ?: return RequestForwarder.errorResponse(503, "SERVICE_ERROR", "Auth not available")
+            if (!auth.isAuthorized(callingUid, this@ChatCompletionService)) {
+                if (!auth.grantAuthorization(callingUid, this@ChatCompletionService)) {
+                    return RequestForwarder.errorResponse(403, "UNAUTHORIZED", "Package not authorized")
+                }
+            }
+
+            val repo = keyRepository
+                ?: return RequestForwarder.errorResponse(503, "SERVICE_ERROR", "Key store not available")
+            return ModelCatalog.buildResponse(repo.getAllKeys())
+        }
     }
 
     private fun extractTotalTokens(body: String): Int = try {

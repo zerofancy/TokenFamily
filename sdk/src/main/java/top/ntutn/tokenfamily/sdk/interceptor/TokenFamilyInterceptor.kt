@@ -27,6 +27,10 @@ class TokenFamilyInterceptor(
 
     override fun intercept(chain: Interceptor.Chain): Response {
         val originalRequest = chain.request()
+        if (isModelsListRequest(originalRequest)) {
+            serviceConnector.connect()
+            return handleModelsListRequest(originalRequest)
+        }
         if (!isChatCompletionRequest(originalRequest)) return chain.proceed(originalRequest)
 
         val converted = try {
@@ -45,6 +49,11 @@ class TokenFamilyInterceptor(
         } else {
             handleNonStreamRequest(originalRequest, converted.binderRequest)
         }
+    }
+
+    private fun handleModelsListRequest(originalRequest: Request): Response {
+        val response = binderCall { serviceConnector.getService().listModels() }
+        return response.toHttpResponse(originalRequest)
     }
 
     private fun handleNonStreamRequest(
@@ -164,4 +173,10 @@ class TokenFamilyInterceptor(
         val path = request.url.encodedPath
         return path.endsWith("/v1/chat/completions") || path.endsWith("/chat/completions")
     }
+}
+
+internal fun isModelsListRequest(request: Request): Boolean {
+    if (request.method != "GET") return false
+    val path = request.url.encodedPath
+    return path.endsWith("/v1/models") || path.endsWith("/models")
 }

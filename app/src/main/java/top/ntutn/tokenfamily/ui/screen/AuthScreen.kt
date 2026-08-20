@@ -20,7 +20,6 @@ fun AuthScreen(
     modifier: Modifier = Modifier
 ) {
     val authorizedApps by viewModel.authorizedApps.collectAsState()
-    val isServiceRunning by viewModel.isServiceRunning.collectAsState()
 
     Scaffold(
         modifier = modifier,
@@ -33,30 +32,6 @@ fun AuthScreen(
                 .padding(16.dp),
             verticalArrangement = Arrangement.spacedBy(16.dp)
         ) {
-            Card(modifier = Modifier.fillMaxWidth()) {
-                Row(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .padding(16.dp),
-                    horizontalArrangement = Arrangement.SpaceBetween,
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    Column {
-                        Text("AI 转发服务", style = MaterialTheme.typography.titleMedium)
-                        Text(
-                            if (isServiceRunning) "运行中" else "已停止",
-                            style = MaterialTheme.typography.bodySmall,
-                            color = if (isServiceRunning) MaterialTheme.colorScheme.primary
-                            else MaterialTheme.colorScheme.error
-                        )
-                    }
-                    Switch(
-                        checked = isServiceRunning,
-                        onCheckedChange = { viewModel.toggleService() }
-                    )
-                }
-            }
-
             Text("已授权应用", style = MaterialTheme.typography.titleMedium)
 
             if (authorizedApps.isEmpty()) {

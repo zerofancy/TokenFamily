@@ -206,6 +206,23 @@ class ServiceConnector(private val context: Context) {
             addFlags(Intent.FLAG_INCLUDE_STOPPED_PACKAGES)
         }
 
+        // 先尝试 startForegroundService 触发 onStartCommand，Service 内部自动显示前台通知；
+        // 即使此调用因系统限制（Android 12+ 后台启动限制 / Android 14 前台服务类型缺失 / 权限不足）失败，
+        // 后续 bindService 依然会拉起服务，且服务端已在 onBind 内兜底保证前台通知。
+        try {
+            context.startForegroundService(intent)
+            Log.d(TAG, "startForegroundService requested for TokenFamily service")
+        } catch (e: IllegalStateException) {
+            // ForegroundServiceStartNotAllowedException (API 31+)：后台无法启动前台服务，降级为仅 bind
+            Log.w(TAG, "startForegroundService blocked (background restriction), fallback to bindService only: ${e.message}")
+        } catch (e: SecurityException) {
+            // 权限或前台服务类型声明缺失
+            Log.w(TAG, "startForegroundService denied (SecurityException), fallback to bindService only: ${e.message}")
+        } catch (e: Exception) {
+            // 兜底：其他未知异常（如服务已在运行、组件未找到等）
+            Log.w(TAG, "startForegroundService skipped: ${e.message}")
+        }
+
         val result = try {
             context.bindService(intent, serviceConnection, Context.BIND_AUTO_CREATE)
         } catch (e: Exception) {

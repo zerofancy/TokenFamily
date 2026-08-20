@@ -5,6 +5,7 @@ import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
 import android.app.Service
+import android.content.SharedPreferences
 import android.content.Context
 import android.content.Intent
 import android.os.Binder
@@ -28,7 +29,9 @@ class ChatCompletionService : Service() {
         private const val TAG = "TokenFamily"
         private const val CHANNEL_ID = "agentcore_service"
         private const val NOTIFICATION_ID = 1
-        private const val AUTO_STOP_DELAY_MS = 5 * 60 * 1000L
+        private const val PREFS_NAME = "agentcore_settings"
+        private const val KEY_AUTO_STOP_DELAY = "auto_stop_delay_minutes"
+        private const val DEFAULT_DELAY_MINUTES = 5
     }
 
     private val requestForwarder = RequestForwarder()
@@ -39,21 +42,31 @@ class ChatCompletionService : Service() {
     private var autoStopRunnable: Runnable? = null
     private var bindCount = 0
     private var initialized = false
+    private lateinit var prefs: SharedPreferences
 
     override fun onCreate() {
         super.onCreate()
+        prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
         try {
             val keyStoreManager = KeyStoreManager.getInstance(this)
             keyRepository = KeyRepository(keyStoreManager)
             authManager = AuthManager.getInstance(this)
             streamForwarder = StreamForwarder()
-            startForegroundService()
             initialized = true
             Log.i(TAG, "Service created successfully")
         } catch (e: Exception) {
             Log.e(TAG, "Service onCreate failed", e)
             initialized = false
         }
+    }
+
+    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        ensureForegroundNotification()
+        // START_STICKY 重启后 intent 为 null，此时不进行自停调度，避免"重启→停→重启"的循环抖动
+        if (intent != null && bindCount <= 0) {
+            scheduleAutoStop()
+        }
+        return START_STICKY
     }
 
     override fun onDestroy() {
@@ -66,6 +79,10 @@ class ChatCompletionService : Service() {
     override fun onBind(intent: Intent?): IBinder {
         bindCount++
         cancelAutoStop()
+        // 兜底：如果 SDK 侧 startForegroundService 被系统拦截/失败，
+        // 仅通过 bindService 拉起时也必须确保前台通知到位，
+        // 避免 ForegroundServiceDidNotStartInTimeException 与无通知长绑定。
+        ensureForegroundNotification()
         Log.i(TAG, "Service bound, clientCount=$bindCount")
         return binder
     }
@@ -251,7 +268,7 @@ class ChatCompletionService : Service() {
         )
     }
 
-    private fun startForegroundService() {
+    private fun ensureForegroundNotification() {
         try {
             createNotificationChannel()
             val pendingIntent = PendingIntent.getActivity(
@@ -262,7 +279,7 @@ class ChatCompletionService : Service() {
             )
             val notification = Notification.Builder(this, CHANNEL_ID)
                 .setContentTitle("词元芯核")
-                .setContentText("AI service is running")
+                .setContentText("AI 转发服务运行中")
                 .setSmallIcon(android.R.drawable.ic_menu_info_details)
                 .setContentIntent(pendingIntent)
                 .setOngoing(true)
@@ -288,8 +305,12 @@ class ChatCompletionService : Service() {
 
     private fun scheduleAutoStop() {
         cancelAutoStop()
-        autoStopRunnable = Runnable { stopSelf() }
-        handler.postDelayed(autoStopRunnable!!, AUTO_STOP_DELAY_MS)
+        val delayMinutes = prefs.getInt(KEY_AUTO_STOP_DELAY, DEFAULT_DELAY_MINUTES)
+        autoStopRunnable = Runnable {
+            stopForeground(STOP_FOREGROUND_REMOVE)
+            stopSelf()
+        }
+        handler.postDelayed(autoStopRunnable!!, delayMinutes * 60 * 1000L)
     }
 
     private fun cancelAutoStop() {
